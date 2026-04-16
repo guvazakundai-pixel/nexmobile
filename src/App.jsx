@@ -1,19 +1,20 @@
 import { useState, useEffect, useMemo, useCallback, createContext, useContext } from "react";
 import PHONES_DEFAULT, { BRANDS, SERIES_LIST } from "./data/phones";
+import * as API from "./api";
 
 /* ═══════════════════════════════════════════════════════════════════════════════
    NEXMOBILE — Complete E-Commerce Store + Admin Panel
+   Backend-powered with JWT auth. Falls back to defaults if API is unreachable.
    ═══════════════════════════════════════════════════════════════════════════════ */
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const CFG = { brand: "NEXMOBILE", tagline: "Zimbabwe's #1 Phone Store", wa: "263781138456", adminPw: "nexmobile2024", perPage: 20 };
+const CFG = { brand: "NEXMOBILE", tagline: "Zimbabwe's #1 Phone Store", wa: "263781138456", perPage: 20 };
 const waLink = (m) => `https://wa.me/${CFG.wa}?text=${encodeURIComponent(m)}`;
 const waOrder = (p) => waLink(`Hi ${CFG.brand}! I'm interested in:\n\n${p.name}\n${p.storage} / ${p.ram}\nPrice: $${p.price}\n\nIs it available?`);
 const fmt = (n) => `$${Number(n).toLocaleString()}`;
 const starStr = (n) => "\u2605".repeat(Math.round(n)) + "\u2606".repeat(5 - Math.round(n));
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
-// ─── LOCAL STORAGE HELPERS ────────────────────────────────────────────────────
+// ─── LOCAL STORAGE (cart & wishlist only — these are per-user) ────────────────
 const ls = {
   get: (k, d) => { try { const v = localStorage.getItem(`nex_${k}`); return v ? JSON.parse(v) : d; } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(`nex_${k}`, JSON.stringify(v)); } catch {} },
@@ -22,21 +23,42 @@ const ls = {
 // ─── STORE CONTEXT ────────────────────────────────────────────────────────────
 const StoreCtx = createContext();
 function StoreProvider({ children }) {
-  const [phones, setPhones] = useState(() => ls.get("phones", PHONES_DEFAULT));
+  const [phones, setPhones] = useState(PHONES_DEFAULT);
   const [cart, setCart] = useState(() => ls.get("cart", []));
   const [wishlist, setWishlist] = useState(() => ls.get("wish", []));
-  const [orders, setOrders] = useState(() => ls.get("orders", []));
-  const [banners, setBanners] = useState(() => ls.get("banners", [{ id: "1", text: "Free delivery on orders over $200!", active: true }, { id: "2", text: "New Samsung S26 series now available!", active: true }]));
-  const [settings, setSettings] = useState(() => ls.get("settings", { storeName: CFG.brand, waNumber: CFG.wa, adminPw: CFG.adminPw }));
+  const [orders, setOrders] = useState([]);
+  const [banners, setBanners] = useState([]);
+  const [settings, setSettings] = useState({ storeName: CFG.brand, waNumber: CFG.wa });
   const [dark, setDark] = useState(() => ls.get("dark", false));
   const [toast, setToast] = useState(null);
+  const [apiOnline, setApiOnline] = useState(false);
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => { ls.set("phones", phones); }, [phones]);
+  // Load data from API on mount
+  useEffect(() => {
+    async function load() {
+      try {
+        const [phonesData, bannersData, settingsData] = await Promise.all([
+          API.getPhones(),
+          API.getBanners(),
+          API.getSettings(),
+        ]);
+        setPhones(phonesData);
+        setBanners(bannersData);
+        if (settingsData.storeName) setSettings(settingsData);
+        setApiOnline(true);
+      } catch {
+        // API offline — use defaults
+        setApiOnline(false);
+      }
+      setLoading(false);
+    }
+    load();
+  }, []);
+
+  // Persist cart/wishlist/dark locally (these are per-user, not shared)
   useEffect(() => { ls.set("cart", cart); }, [cart]);
   useEffect(() => { ls.set("wish", wishlist); }, [wishlist]);
-  useEffect(() => { ls.set("orders", orders); }, [orders]);
-  useEffect(() => { ls.set("banners", banners); }, [banners]);
-  useEffect(() => { ls.set("settings", settings); }, [settings]);
   useEffect(() => { ls.set("dark", dark); document.body.classList.toggle("dark", dark); }, [dark]);
   useEffect(() => { if (toast) { const t = setTimeout(() => setToast(null), 2500); return () => clearTimeout(t); } }, [toast]);
 
@@ -64,10 +86,18 @@ function StoreProvider({ children }) {
   const cartTotal = useMemo(() => cart.reduce((s, i) => s + i.price * i.qty, 0), [cart]);
   const cartCount = useMemo(() => cart.reduce((s, i) => s + i.qty, 0), [cart]);
 
+  // Reload phones from API (called after admin makes changes)
+  const reloadPhones = useCallback(async () => {
+    try {
+      const data = await API.getPhones();
+      setPhones(data);
+    } catch {}
+  }, []);
+
   const value = {
     phones, setPhones, cart, addToCart, updateCartQty, removeFromCart, clearCart, cartTotal, cartCount,
     wishlist, toggleWish, orders, setOrders, banners, setBanners, settings, setSettings,
-    dark, setDark, toast, setToast,
+    dark, setDark, toast, setToast, apiOnline, loading, reloadPhones,
   };
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;
 }
@@ -85,12 +115,19 @@ export default function App() {
 }
 
 function AppRouter() {
-  const [view, setView] = useState("store"); // store | admin
+  const [view, setView] = useState("store");
   const [adminAuth, setAdminAuth] = useState(false);
+
+  // Check if we have a valid token on mount
+  useEffect(() => {
+    if (API.getToken()) {
+      API.verifyToken().then(valid => { if (valid) setAdminAuth(true); });
+    }
+  }, []);
 
   if (view === "admin") {
     if (!adminAuth) return <AdminLogin onAuth={() => setAdminAuth(true)} onBack={() => setView("store")} />;
-    return <AdminPanel onLogout={() => { setAdminAuth(false); setView("store"); }} />;
+    return <AdminPanel onLogout={() => { API.logout(); setAdminAuth(false); setView("store"); }} />;
   }
   return <StoreFront onAdmin={() => setView("admin")} />;
 }
@@ -99,7 +136,7 @@ function AppRouter() {
 // STOREFRONT
 // ═════════════════════════════════════════════════════════════════════════════
 function StoreFront({ onAdmin }) {
-  const { phones, dark, setDark, cartCount, wishlist, banners, toast } = useStore();
+  const { phones, dark, setDark, cartCount, wishlist, banners, toast, loading, apiOnline } = useStore();
   const [search, setSearch] = useState("");
   const [brand, setBrand] = useState("All");
   const [series, setSeries] = useState("All");
@@ -133,7 +170,13 @@ function StoreFront({ onAdmin }) {
   const paginated = filtered.slice((page - 1) * CFG.perPage, page * CFG.perPage);
   useEffect(() => setPage(1), [brand, series, search, sort, showWish]);
 
-  const activeBanners = banners.filter(b => b.active);
+  if (loading) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh", fontSize: 18, color: "#6b7280" }}>
+        Loading...
+      </div>
+    );
+  }
 
   return (
     <div className="fade-in">
@@ -163,6 +206,13 @@ function StoreFront({ onAdmin }) {
         </div>
       </nav>
 
+      {/* API Status Banner */}
+      {!apiOnline && (
+        <div style={{ background: "#fef3c7", color: "#92400e", textAlign: "center", padding: "6px 16px", fontSize: 13, fontWeight: 600 }}>
+          Showing default catalog. Connect backend for live data.
+        </div>
+      )}
+
       {/* Category Chips */}
       <div className="cat-bar">
         {["All", "Samsung", "Apple", "Google"].map(b => (
@@ -178,7 +228,7 @@ function StoreFront({ onAdmin }) {
       {!search && brand === "All" && !showWish && (
         <div className="hero">
           <div className="hero__card">
-            <h2>{activeBanners[0]?.text || "Welcome to NEXMOBILE"}</h2>
+            <h2>{banners.length > 0 ? banners[0].text : "Welcome to NEXMOBILE"}</h2>
             <p>Premium smartphones at Zimbabwe's best prices. Boxed & sealed with warranty.</p>
             <button className="hero__btn" onClick={() => setBrand("Samsung")}>Shop Samsung &#8594;</button>
           </div>
@@ -255,18 +305,13 @@ function StoreFront({ onAdmin }) {
         <div className="footer__bottom">&copy; 2024-2026 {CFG.brand}. All rights reserved.</div>
       </footer>
 
-      {/* Product Detail Modal */}
       {detail && <ProductDetail phone={detail} onClose={() => setDetail(null)} />}
-
-      {/* Cart Sidebar */}
       {cartOpen && <CartPanel onClose={() => setCartOpen(false)} />}
 
-      {/* WhatsApp Float */}
       <a className="wa-float" href={waLink(`Hi ${CFG.brand}! I'd like to browse your phones.`)} target="_blank" rel="noopener noreferrer" title="Chat on WhatsApp">
         &#128172;
       </a>
 
-      {/* Toast */}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -402,15 +447,19 @@ function ProductDetail({ phone, onClose }) {
 
 // ─── CART PANEL ───────────────────────────────────────────────────────────────
 function CartPanel({ onClose }) {
-  const { cart, updateCartQty, removeFromCart, clearCart, cartTotal, setOrders, setToast } = useStore();
+  const { cart, updateCartQty, removeFromCart, clearCart, cartTotal, setToast } = useStore();
   const brandInitial = (b) => (BRANDS[b]?.icon || "?");
 
-  const checkout = () => {
+  const checkout = async () => {
     if (cart.length === 0) return;
     const items = cart.map(i => `${i.name} (${i.storage}) x${i.qty} = ${fmt(i.price * i.qty)}`).join("\n");
     const msg = `Hi ${CFG.brand}!\n\nI'd like to order:\n\n${items}\n\nTotal: ${fmt(cartTotal)}\n\nPlease confirm availability.`;
-    const order = { id: uid(), items: [...cart], total: cartTotal, date: new Date().toISOString(), status: "pending" };
-    setOrders(prev => [order, ...prev]);
+
+    // Save order to backend
+    try {
+      await API.createOrder({ items: [...cart], total: cartTotal });
+    } catch {}
+
     window.open(waLink(msg), "_blank");
     setToast("Order sent via WhatsApp!");
   };
@@ -466,26 +515,35 @@ function CartPanel({ onClose }) {
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ADMIN PANEL
+// ADMIN PANEL — All operations go through the API
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ─── ADMIN LOGIN ──────────────────────────────────────────────────────────────
 function AdminLogin({ onAuth, onBack }) {
-  const { settings } = useStore();
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
-  const submit = (e) => {
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
     e.preventDefault();
-    if (pw === settings.adminPw) onAuth();
-    else setErr("Incorrect password");
+    setBusy(true);
+    setErr("");
+    try {
+      await API.login(pw);
+      onAuth();
+    } catch (e) {
+      setErr(e.message || "Login failed. Is the backend running?");
+    }
+    setBusy(false);
   };
+
   return (
     <div className="login">
       <form className="login__card" onSubmit={submit}>
         <div className="login__logo">{CFG.brand}</div>
         <div className="login__sub">Admin Panel Login</div>
         <input className="login__input" type="password" placeholder="Enter password" value={pw} onChange={e => { setPw(e.target.value); setErr(""); }} autoFocus />
-        <button className="login__btn" type="submit">Login</button>
+        <button className="login__btn" type="submit" disabled={busy}>{busy ? "Logging in..." : "Login"}</button>
         {err && <div className="login__error">{err}</div>}
         <button type="button" style={{ marginTop: 16, color: "#6b7280", fontSize: 13 }} onClick={onBack}>&larr; Back to Store</button>
       </form>
@@ -555,71 +613,58 @@ function AdminPanel({ onLogout }) {
 
 // ─── ADMIN: DASHBOARD ─────────────────────────────────────────────────────────
 function AdminDashboard() {
-  const { phones, orders, cart } = useStore();
-  const totalRevenuePotential = phones.reduce((s, p) => s + p.price * p.stock, 0);
-  const totalProfit = phones.reduce((s, p) => s + (p.price - p.basePrice) * p.stock, 0);
-  const lowStock = phones.filter(p => p.stock <= 3).length;
-  const outOfStock = phones.filter(p => p.stock === 0).length;
-  const avgPrice = Math.round(phones.reduce((s, p) => s + p.price, 0) / phones.length);
+  const { reloadPhones } = useStore();
+  const [phones, setPhones] = useState([]);
+  const [orders, setOrders] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const [p, o] = await Promise.all([API.getPhonesFull(), API.getOrders()]);
+        setPhones(p);
+        setOrders(o);
+      } catch {}
+      setLoading(false);
+    }
+    load();
+  }, []);
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: "#6b7280" }}>Loading dashboard...</div>;
+
+  const totalRevenuePotential = phones.reduce((s, p) => s + p.price * (p.stock || 0), 0);
+  const totalProfit = phones.reduce((s, p) => s + (p.price - (p.basePrice || 0)) * (p.stock || 0), 0);
+  const lowStock = phones.filter(p => (p.stock || 0) <= 3).length;
+  const outOfStock = phones.filter(p => (p.stock || 0) === 0).length;
+  const avgPrice = phones.length ? Math.round(phones.reduce((s, p) => s + p.price, 0) / phones.length) : 0;
 
   return (
     <div className="fade-in">
-      <div className="admin__header">
-        <h1 className="admin__title">Dashboard</h1>
-      </div>
+      <div className="admin__header"><h1 className="admin__title">Dashboard</h1></div>
       <div className="admin__stats">
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Total Products</div>
-          <div className="admin__stat-value">{phones.length}</div>
-        </div>
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Revenue Potential</div>
-          <div className="admin__stat-value">{fmt(totalRevenuePotential)}</div>
-        </div>
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Potential Profit</div>
-          <div className="admin__stat-value" style={{ color: "#10b981" }}>{fmt(totalProfit)}</div>
-        </div>
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Avg. Price</div>
-          <div className="admin__stat-value">{fmt(avgPrice)}</div>
-        </div>
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Low Stock Alerts</div>
-          <div className="admin__stat-value" style={{ color: lowStock > 0 ? "#f59e0b" : "#10b981" }}>{lowStock}</div>
-        </div>
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Out of Stock</div>
-          <div className="admin__stat-value" style={{ color: outOfStock > 0 ? "#ef4444" : "#10b981" }}>{outOfStock}</div>
-        </div>
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Total Orders</div>
-          <div className="admin__stat-value">{orders.length}</div>
-        </div>
-        <div className="admin__stat-card">
-          <div className="admin__stat-label">Items in Carts</div>
-          <div className="admin__stat-value">{cart.length}</div>
-        </div>
+        <div className="admin__stat-card"><div className="admin__stat-label">Total Products</div><div className="admin__stat-value">{phones.length}</div></div>
+        <div className="admin__stat-card"><div className="admin__stat-label">Revenue Potential</div><div className="admin__stat-value">{fmt(totalRevenuePotential)}</div></div>
+        <div className="admin__stat-card"><div className="admin__stat-label">Potential Profit</div><div className="admin__stat-value" style={{ color: "#10b981" }}>{fmt(totalProfit)}</div></div>
+        <div className="admin__stat-card"><div className="admin__stat-label">Avg. Price</div><div className="admin__stat-value">{fmt(avgPrice)}</div></div>
+        <div className="admin__stat-card"><div className="admin__stat-label">Low Stock</div><div className="admin__stat-value" style={{ color: lowStock > 0 ? "#f59e0b" : "#10b981" }}>{lowStock}</div></div>
+        <div className="admin__stat-card"><div className="admin__stat-label">Out of Stock</div><div className="admin__stat-value" style={{ color: outOfStock > 0 ? "#ef4444" : "#10b981" }}>{outOfStock}</div></div>
+        <div className="admin__stat-card"><div className="admin__stat-label">Total Orders</div><div className="admin__stat-value">{orders.length}</div></div>
       </div>
 
-      {/* Brand Breakdown */}
       <h3 style={{ marginBottom: 12, fontSize: 16, fontWeight: 700 }}>By Brand</h3>
       <div className="admin__stats" style={{ marginBottom: 24 }}>
         {Object.keys(BRANDS).map(b => {
-          const brandPhones = phones.filter(p => p.brand === b);
-          return (
+          const bp = phones.filter(p => p.brand === b);
+          return bp.length > 0 ? (
             <div key={b} className="admin__stat-card">
               <div className="admin__stat-label" style={{ color: BRANDS[b].color }}>{b}</div>
-              <div className="admin__stat-value">{brandPhones.length}</div>
-              <div className="admin__stat-change" style={{ color: "#6b7280" }}>
-                {fmt(Math.min(...brandPhones.map(p => p.price)))} - {fmt(Math.max(...brandPhones.map(p => p.price)))}
-              </div>
+              <div className="admin__stat-value">{bp.length}</div>
+              <div style={{ fontSize: 12, color: "#6b7280" }}>{fmt(Math.min(...bp.map(p => p.price)))} - {fmt(Math.max(...bp.map(p => p.price)))}</div>
             </div>
-          );
+          ) : null;
         })}
       </div>
 
-      {/* Low Stock Items */}
       {lowStock > 0 && (
         <>
           <h3 style={{ marginBottom: 12, fontSize: 16, fontWeight: 700, color: "#f59e0b" }}>Low Stock Items</h3>
@@ -627,7 +672,7 @@ function AdminDashboard() {
             <table className="admin__table">
               <thead><tr><th>Product</th><th>Stock</th><th>Price</th></tr></thead>
               <tbody>
-                {phones.filter(p => p.stock <= 3).map(p => (
+                {phones.filter(p => (p.stock || 0) <= 3).map(p => (
                   <tr key={p.id}><td>{p.name}</td><td style={{ color: p.stock === 0 ? "#ef4444" : "#f59e0b", fontWeight: 700 }}>{p.stock}</td><td>{fmt(p.price)}</td></tr>
                 ))}
               </tbody>
@@ -641,40 +686,68 @@ function AdminDashboard() {
 
 // ─── ADMIN: PRODUCTS ──────────────────────────────────────────────────────────
 function AdminProducts() {
-  const { phones, setPhones, setToast } = useStore();
+  const { setToast, reloadPhones } = useStore();
+  const [phones, setPhones] = useState([]);
   const [search, setSearch] = useState("");
   const [brandFilter, setBrandFilter] = useState("All");
   const [editPhone, setEditPhone] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const loadPhones = useCallback(async () => {
+    try {
+      const data = await API.getPhonesFull();
+      setPhones(data);
+    } catch (e) { setToast("Failed to load products"); }
+    setLoading(false);
+  }, [setToast]);
+
+  useEffect(() => { loadPhones(); }, [loadPhones]);
 
   const filtered = useMemo(() => {
     let list = [...phones];
     if (brandFilter !== "All") list = list.filter(p => p.brand === brandFilter);
-    if (search) {
-      const q = search.toLowerCase();
-      list = list.filter(p => p.name.toLowerCase().includes(q));
-    }
+    if (search) { const q = search.toLowerCase(); list = list.filter(p => p.name.toLowerCase().includes(q)); }
     return list.sort((a, b) => a.name.localeCompare(b.name));
   }, [phones, search, brandFilter]);
 
-  const deletePhone = (id) => {
+  const deletePhone = async (id) => {
     if (!confirm("Delete this product?")) return;
-    setPhones(prev => prev.filter(p => p.id !== id));
-    setToast("Product deleted");
+    try {
+      await API.deletePhone(id);
+      setToast("Product deleted");
+      loadPhones();
+      reloadPhones();
+    } catch (e) { setToast(e.message); }
   };
 
-  const savePhone = (data) => {
-    if (data.id) {
-      setPhones(prev => prev.map(p => p.id === data.id ? { ...p, ...data } : p));
-      setToast("Product updated");
-    } else {
-      const newId = Math.max(0, ...phones.map(p => p.id)) + 1;
-      setPhones(prev => [...prev, { ...data, id: newId }]);
-      setToast("Product added");
-    }
+  const savePhone = async (data) => {
+    try {
+      if (data.id) {
+        await API.updatePhone(data.id, data);
+        setToast("Product updated");
+      } else {
+        await API.addPhone(data);
+        setToast("Product added");
+      }
+      loadPhones();
+      reloadPhones();
+    } catch (e) { setToast(e.message); }
     setEditPhone(null);
     setShowAdd(false);
   };
+
+  const resetAll = async () => {
+    if (!confirm("Reset all products to defaults?")) return;
+    try {
+      await API.resetPhones();
+      setToast("Products reset");
+      loadPhones();
+      reloadPhones();
+    } catch (e) { setToast(e.message); }
+  };
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: "#6b7280" }}>Loading products...</div>;
 
   return (
     <div className="fade-in">
@@ -682,7 +755,7 @@ function AdminProducts() {
         <h1 className="admin__title">Products ({phones.length})</h1>
         <div className="admin__header-actions">
           <button className="admin__btn admin__btn--primary" onClick={() => setShowAdd(true)}>+ Add Product</button>
-          <button className="admin__btn admin__btn--outline" onClick={() => { if (confirm("Reset all products to defaults?")) { setPhones(PHONES_DEFAULT); setToast("Products reset"); } }}>Reset</button>
+          <button className="admin__btn admin__btn--outline" onClick={resetAll}>Reset</button>
         </div>
       </div>
 
@@ -698,9 +771,7 @@ function AdminProducts() {
 
       <div className="admin__table-wrap" style={{ overflowX: "auto" }}>
         <table className="admin__table">
-          <thead>
-            <tr><th>Name</th><th>Brand</th><th>Storage</th><th>Base</th><th>Sell</th><th>Profit</th><th>Stock</th><th>Actions</th></tr>
-          </thead>
+          <thead><tr><th>Name</th><th>Brand</th><th>Storage</th><th>Base</th><th>Sell</th><th>Profit</th><th>Stock</th><th>Actions</th></tr></thead>
           <tbody>
             {filtered.map(p => (
               <tr key={p.id}>
@@ -710,7 +781,7 @@ function AdminProducts() {
                 <td>{fmt(p.basePrice)}</td>
                 <td style={{ fontWeight: 700, color: "#0056d2" }}>{fmt(p.price)}</td>
                 <td style={{ color: "#10b981", fontWeight: 600 }}>{fmt(p.price - p.basePrice)}</td>
-                <td style={{ color: p.stock <= 3 ? "#f59e0b" : "#10b981", fontWeight: 600 }}>{p.stock}</td>
+                <td style={{ color: (p.stock || 0) <= 3 ? "#f59e0b" : "#10b981", fontWeight: 600 }}>{p.stock}</td>
                 <td>
                   <div className="admin__table-actions">
                     <button className="admin__table-btn" onClick={() => setEditPhone(p)}>Edit</button>
@@ -724,17 +795,13 @@ function AdminProducts() {
       </div>
 
       {(editPhone || showAdd) && (
-        <ProductForm
-          phone={editPhone || {}}
-          onSave={savePhone}
-          onClose={() => { setEditPhone(null); setShowAdd(false); }}
-        />
+        <ProductForm phone={editPhone || {}} onSave={savePhone} onClose={() => { setEditPhone(null); setShowAdd(false); }} />
       )}
     </div>
   );
 }
 
-// ─── PRODUCT FORM (Add/Edit) ──────────────────────────────────────────────────
+// ─── PRODUCT FORM ─────────────────────────────────────────────────────────────
 function ProductForm({ phone, onSave, onClose }) {
   const [form, setForm] = useState({
     name: phone.name || "", brand: phone.brand || "Samsung", series: phone.series || "Galaxy S",
@@ -753,7 +820,7 @@ function ProductForm({ phone, onSave, onClose }) {
   const save = (e) => {
     e.preventDefault();
     onSave({
-      ...phone, ...form,
+      ...(phone.id ? { id: phone.id } : {}), ...form,
       basePrice: Number(form.basePrice), price: Number(form.price),
       rating: Number(form.rating), reviews: Number(form.reviews),
       discount: Number(form.discount), stock: Number(form.stock),
@@ -769,112 +836,46 @@ function ProductForm({ phone, onSave, onClose }) {
           <button className="admin__modal-close" onClick={onClose}>&times;</button>
         </div>
         <form className="admin__modal-body" onSubmit={save}>
-          <div className="admin__form-group">
-            <label className="admin__form-label">Phone Name</label>
-            <input className="admin__form-input" value={form.name} onChange={e => u("name", e.target.value)} required />
+          <div className="admin__form-group"><label className="admin__form-label">Phone Name</label><input className="admin__form-input" value={form.name} onChange={e => u("name", e.target.value)} required /></div>
+          <div className="admin__form-row">
+            <div className="admin__form-group"><label className="admin__form-label">Brand</label><select className="admin__form-input" value={form.brand} onChange={e => u("brand", e.target.value)}><option>Samsung</option><option>Apple</option><option>Google</option></select></div>
+            <div className="admin__form-group"><label className="admin__form-label">Series</label><input className="admin__form-input" value={form.series} onChange={e => u("series", e.target.value)} /></div>
           </div>
           <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">Brand</label>
-              <select className="admin__form-input" value={form.brand} onChange={e => u("brand", e.target.value)}>
-                <option>Samsung</option><option>Apple</option><option>Google</option>
-              </select>
-            </div>
-            <div className="admin__form-group">
-              <label className="admin__form-label">Series</label>
-              <input className="admin__form-input" value={form.series} onChange={e => u("series", e.target.value)} />
-            </div>
+            <div className="admin__form-group"><label className="admin__form-label">RAM</label><input className="admin__form-input" value={form.ram} onChange={e => u("ram", e.target.value)} /></div>
+            <div className="admin__form-group"><label className="admin__form-label">Default Storage</label><input className="admin__form-input" value={form.storage} onChange={e => u("storage", e.target.value)} /></div>
+          </div>
+          <div className="admin__form-group"><label className="admin__form-label">Storage Options (comma-separated)</label><input className="admin__form-input" value={form.storageOptions} onChange={e => u("storageOptions", e.target.value)} /></div>
+          <div className="admin__form-row">
+            <div className="admin__form-group"><label className="admin__form-label">Base Price (USD)</label><input className="admin__form-input" type="number" value={form.basePrice} onChange={e => u("basePrice", e.target.value)} /></div>
+            <div className="admin__form-group"><label className="admin__form-label">Sell Price (USD)</label><input className="admin__form-input" type="number" value={form.price} onChange={e => u("price", e.target.value)} /></div>
+          </div>
+          <div className="admin__form-group"><label className="admin__form-label">Display</label><input className="admin__form-input" value={form.display} onChange={e => u("display", e.target.value)} /></div>
+          <div className="admin__form-group"><label className="admin__form-label">Camera</label><input className="admin__form-input" value={form.camera} onChange={e => u("camera", e.target.value)} /></div>
+          <div className="admin__form-row">
+            <div className="admin__form-group"><label className="admin__form-label">Front Camera</label><input className="admin__form-input" value={form.frontCamera} onChange={e => u("frontCamera", e.target.value)} /></div>
+            <div className="admin__form-group"><label className="admin__form-label">Battery</label><input className="admin__form-input" value={form.battery} onChange={e => u("battery", e.target.value)} /></div>
           </div>
           <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">RAM</label>
-              <input className="admin__form-input" value={form.ram} onChange={e => u("ram", e.target.value)} />
-            </div>
-            <div className="admin__form-group">
-              <label className="admin__form-label">Default Storage</label>
-              <input className="admin__form-input" value={form.storage} onChange={e => u("storage", e.target.value)} />
-            </div>
-          </div>
-          <div className="admin__form-group">
-            <label className="admin__form-label">Storage Options (comma-separated)</label>
-            <input className="admin__form-input" value={form.storageOptions} onChange={e => u("storageOptions", e.target.value)} />
+            <div className="admin__form-group"><label className="admin__form-label">Processor</label><input className="admin__form-input" value={form.processor} onChange={e => u("processor", e.target.value)} /></div>
+            <div className="admin__form-group"><label className="admin__form-label">OS</label><input className="admin__form-input" value={form.os} onChange={e => u("os", e.target.value)} /></div>
           </div>
           <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">Base Price (USD)</label>
-              <input className="admin__form-input" type="number" value={form.basePrice} onChange={e => u("basePrice", e.target.value)} />
-            </div>
-            <div className="admin__form-group">
-              <label className="admin__form-label">Sell Price (USD)</label>
-              <input className="admin__form-input" type="number" value={form.price} onChange={e => u("price", e.target.value)} />
-            </div>
-          </div>
-          <div className="admin__form-group">
-            <label className="admin__form-label">Display</label>
-            <input className="admin__form-input" value={form.display} onChange={e => u("display", e.target.value)} />
-          </div>
-          <div className="admin__form-group">
-            <label className="admin__form-label">Camera</label>
-            <input className="admin__form-input" value={form.camera} onChange={e => u("camera", e.target.value)} />
+            <div className="admin__form-group"><label className="admin__form-label">Rating (1-5)</label><input className="admin__form-input" type="number" step="0.1" min="1" max="5" value={form.rating} onChange={e => u("rating", e.target.value)} /></div>
+            <div className="admin__form-group"><label className="admin__form-label">Reviews Count</label><input className="admin__form-input" type="number" value={form.reviews} onChange={e => u("reviews", e.target.value)} /></div>
           </div>
           <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">Front Camera</label>
-              <input className="admin__form-input" value={form.frontCamera} onChange={e => u("frontCamera", e.target.value)} />
-            </div>
-            <div className="admin__form-group">
-              <label className="admin__form-label">Battery</label>
-              <input className="admin__form-input" value={form.battery} onChange={e => u("battery", e.target.value)} />
-            </div>
+            <div className="admin__form-group"><label className="admin__form-label">Stock</label><input className="admin__form-input" type="number" value={form.stock} onChange={e => u("stock", e.target.value)} /></div>
+            <div className="admin__form-group"><label className="admin__form-label">Discount %</label><input className="admin__form-input" type="number" min="0" max="100" value={form.discount} onChange={e => u("discount", e.target.value)} /></div>
           </div>
           <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">Processor</label>
-              <input className="admin__form-input" value={form.processor} onChange={e => u("processor", e.target.value)} />
-            </div>
-            <div className="admin__form-group">
-              <label className="admin__form-label">OS</label>
-              <input className="admin__form-input" value={form.os} onChange={e => u("os", e.target.value)} />
-            </div>
-          </div>
-          <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">Rating (1-5)</label>
-              <input className="admin__form-input" type="number" step="0.1" min="1" max="5" value={form.rating} onChange={e => u("rating", e.target.value)} />
-            </div>
-            <div className="admin__form-group">
-              <label className="admin__form-label">Reviews Count</label>
-              <input className="admin__form-input" type="number" value={form.reviews} onChange={e => u("reviews", e.target.value)} />
-            </div>
-          </div>
-          <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">Stock</label>
-              <input className="admin__form-input" type="number" value={form.stock} onChange={e => u("stock", e.target.value)} />
-            </div>
-            <div className="admin__form-group">
-              <label className="admin__form-label">Discount %</label>
-              <input className="admin__form-input" type="number" min="0" max="100" value={form.discount} onChange={e => u("discount", e.target.value)} />
-            </div>
-          </div>
-          <div className="admin__form-row">
-            <div className="admin__form-group">
-              <label className="admin__form-label">Badge</label>
-              <input className="admin__form-input" value={form.badge} onChange={e => u("badge", e.target.value)} placeholder="Hot, New, Best Value..." />
-            </div>
+            <div className="admin__form-group"><label className="admin__form-label">Badge</label><input className="admin__form-input" value={form.badge} onChange={e => u("badge", e.target.value)} placeholder="Hot, New, Best Value..." /></div>
             <div className="admin__form-group" style={{ display: "flex", gap: 16, alignItems: "flex-end", paddingBottom: 4 }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
-                <input type="checkbox" checked={form.hot} onChange={e => u("hot", e.target.checked)} /> Hot
-              </label>
-              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
-                <input type="checkbox" checked={form.newArrival} onChange={e => u("newArrival", e.target.checked)} /> New Arrival
-              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}><input type="checkbox" checked={form.hot} onChange={e => u("hot", e.target.checked)} /> Hot</label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}><input type="checkbox" checked={form.newArrival} onChange={e => u("newArrival", e.target.checked)} /> New</label>
             </div>
           </div>
-          <div className="admin__form-group">
-            <label className="admin__form-label">Description</label>
-            <textarea className="admin__form-textarea" value={form.description} onChange={e => u("description", e.target.value)} />
-          </div>
+          <div className="admin__form-group"><label className="admin__form-label">Description</label><textarea className="admin__form-textarea" value={form.description} onChange={e => u("description", e.target.value)} /></div>
           <div className="admin__modal-footer" style={{ padding: 0, border: "none", marginTop: 8 }}>
             <button type="button" className="admin__btn admin__btn--outline" onClick={onClose}>Cancel</button>
             <button type="submit" className="admin__btn admin__btn--primary">Save Product</button>
@@ -887,7 +888,9 @@ function ProductForm({ phone, onSave, onClose }) {
 
 // ─── ADMIN: CATEGORIES ────────────────────────────────────────────────────────
 function AdminCategories() {
-  const { phones } = useStore();
+  const [phones, setPhones] = useState([]);
+  useEffect(() => { API.getPhonesFull().then(setPhones).catch(() => {}); }, []);
+
   const brands = useMemo(() => {
     const map = {};
     phones.forEach(p => {
@@ -900,23 +903,18 @@ function AdminCategories() {
 
   return (
     <div className="fade-in">
-      <div className="admin__header">
-        <h1 className="admin__title">Categories</h1>
-      </div>
+      <div className="admin__header"><h1 className="admin__title">Categories</h1></div>
       {Object.entries(brands).map(([brand, seriesMap]) => (
         <div key={brand} style={{ marginBottom: 24 }}>
           <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ width: 12, height: 12, borderRadius: 3, background: BRANDS[brand]?.color || "#6b7280", display: "inline-block" }} />
-            {brand}
+            <span style={{ width: 12, height: 12, borderRadius: 3, background: BRANDS[brand]?.color || "#6b7280", display: "inline-block" }} />{brand}
           </h3>
           <div className="admin__stats">
             {Object.entries(seriesMap).map(([series, list]) => (
               <div key={series} className="admin__stat-card">
                 <div className="admin__stat-label">{series}</div>
                 <div className="admin__stat-value">{list.length}</div>
-                <div style={{ fontSize: 12, color: "#6b7280", marginTop: 4 }}>
-                  {fmt(Math.min(...list.map(p => p.price)))} - {fmt(Math.max(...list.map(p => p.price)))}
-                </div>
+                <div style={{ fontSize: 12, color: "#6b7280", marginTop: 4 }}>{fmt(Math.min(...list.map(p => p.price)))} - {fmt(Math.max(...list.map(p => p.price)))}</div>
               </div>
             ))}
           </div>
@@ -928,29 +926,29 @@ function AdminCategories() {
 
 // ─── ADMIN: PRICING TOOLS ─────────────────────────────────────────────────────
 function AdminPricing() {
-  const { phones, setPhones, setToast } = useStore();
-  const [mode, setMode] = useState("percent"); // percent | fixed
+  const { setToast, reloadPhones } = useStore();
+  const [phones, setLocalPhones] = useState([]);
+  const [mode, setMode] = useState("percent");
   const [amount, setAmount] = useState("");
   const [direction, setDirection] = useState("increase");
   const [target, setTarget] = useState("All");
   const [seriesTarget, setSeriesTarget] = useState("All");
 
-  const apply = () => {
+  const loadPhones = useCallback(async () => {
+    try { setLocalPhones(await API.getPhonesFull()); } catch {}
+  }, []);
+  useEffect(() => { loadPhones(); }, [loadPhones]);
+
+  const apply = async () => {
     const val = Number(amount);
     if (!val || val <= 0) return;
-    setPhones(prev => prev.map(p => {
-      if (target !== "All" && p.brand !== target) return p;
-      if (seriesTarget !== "All" && p.series !== seriesTarget) return p;
-      let newPrice = p.price;
-      if (mode === "percent") {
-        newPrice = direction === "increase" ? Math.round(p.price * (1 + val / 100)) : Math.round(p.price * (1 - val / 100));
-      } else {
-        newPrice = direction === "increase" ? p.price + val : p.price - val;
-      }
-      return { ...p, price: Math.max(1, Math.round(newPrice)) };
-    }));
-    setToast(`Prices ${direction}d by ${mode === "percent" ? val + "%" : fmt(val)}`);
-    setAmount("");
+    try {
+      await API.bulkPrice({ brand: target, series: seriesTarget, mode, direction, amount: val });
+      setToast(`Prices ${direction}d by ${mode === "percent" ? val + "%" : fmt(val)}`);
+      setAmount("");
+      loadPhones();
+      reloadPhones();
+    } catch (e) { setToast(e.message); }
   };
 
   const margins = useMemo(() => {
@@ -958,7 +956,7 @@ function AdminPricing() {
     phones.forEach(p => {
       const key = p.brand;
       if (!groups[key]) groups[key] = { total: 0, count: 0, min: Infinity, max: -Infinity };
-      const margin = ((p.price - p.basePrice) / p.basePrice * 100);
+      const margin = p.basePrice ? ((p.price - p.basePrice) / p.basePrice * 100) : 0;
       groups[key].total += margin;
       groups[key].count++;
       groups[key].min = Math.min(groups[key].min, margin);
@@ -971,11 +969,8 @@ function AdminPricing() {
 
   return (
     <div className="fade-in">
-      <div className="admin__header">
-        <h1 className="admin__title">Pricing Tools</h1>
-      </div>
+      <div className="admin__header"><h1 className="admin__title">Pricing Tools</h1></div>
 
-      {/* Margin Overview */}
       <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Margin Overview</h3>
       <div className="admin__stats" style={{ marginBottom: 24 }}>
         {margins.map(m => (
@@ -987,34 +982,18 @@ function AdminPricing() {
         ))}
       </div>
 
-      {/* Bulk Price Editor */}
       <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Bulk Price Adjustment</h3>
       <div className="admin__stat-card" style={{ marginBottom: 24 }}>
         <div className="admin__filter-bar" style={{ marginBottom: 0 }}>
-          <select className="admin__select" value={target} onChange={e => setTarget(e.target.value)}>
-            <option value="All">All Brands</option>
-            <option value="Samsung">Samsung</option>
-            <option value="Apple">Apple</option>
-            <option value="Google">Google</option>
-          </select>
-          <select className="admin__select" value={seriesTarget} onChange={e => setSeriesTarget(e.target.value)}>
-            <option value="All">All Series</option>
-            {SERIES_LIST.map(s => <option key={s} value={s}>{s}</option>)}
-          </select>
-          <select className="admin__select" value={direction} onChange={e => setDirection(e.target.value)}>
-            <option value="increase">Increase</option>
-            <option value="decrease">Decrease</option>
-          </select>
-          <select className="admin__select" value={mode} onChange={e => setMode(e.target.value)}>
-            <option value="percent">By %</option>
-            <option value="fixed">By $ Amount</option>
-          </select>
+          <select className="admin__select" value={target} onChange={e => setTarget(e.target.value)}><option value="All">All Brands</option><option value="Samsung">Samsung</option><option value="Apple">Apple</option><option value="Google">Google</option></select>
+          <select className="admin__select" value={seriesTarget} onChange={e => setSeriesTarget(e.target.value)}><option value="All">All Series</option>{SERIES_LIST.map(s => <option key={s} value={s}>{s}</option>)}</select>
+          <select className="admin__select" value={direction} onChange={e => setDirection(e.target.value)}><option value="increase">Increase</option><option value="decrease">Decrease</option></select>
+          <select className="admin__select" value={mode} onChange={e => setMode(e.target.value)}><option value="percent">By %</option><option value="fixed">By $ Amount</option></select>
           <input className="admin__search" style={{ maxWidth: 120 }} type="number" placeholder={mode === "percent" ? "%" : "$"} value={amount} onChange={e => setAmount(e.target.value)} />
           <button className="admin__btn admin__btn--primary" onClick={apply}>Apply</button>
         </div>
       </div>
 
-      {/* Price Table */}
       <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>All Prices</h3>
       <div className="admin__table-wrap" style={{ overflowX: "auto" }}>
         <table className="admin__table">
@@ -1026,7 +1005,7 @@ function AdminPricing() {
                 <td>{fmt(p.basePrice)}</td>
                 <td style={{ fontWeight: 700, color: "#0056d2" }}>{fmt(p.price)}</td>
                 <td style={{ color: "#10b981", fontWeight: 600 }}>{fmt(p.price - p.basePrice)}</td>
-                <td>{Math.round((p.price - p.basePrice) / p.basePrice * 100)}%</td>
+                <td>{p.basePrice ? Math.round((p.price - p.basePrice) / p.basePrice * 100) : 0}%</td>
               </tr>
             ))}
           </tbody>
@@ -1038,42 +1017,45 @@ function AdminPricing() {
 
 // ─── ADMIN: ORDERS ────────────────────────────────────────────────────────────
 function AdminOrders() {
-  const { orders, setOrders } = useStore();
+  const { setToast } = useStore();
+  const [orders, setOrders] = useState([]);
+  const [loading, setLoading] = useState(true);
 
-  const updateStatus = (id, status) => {
-    setOrders(prev => prev.map(o => o.id === id ? { ...o, status } : o));
+  const loadOrders = useCallback(async () => {
+    try { setOrders(await API.getOrders()); } catch {}
+    setLoading(false);
+  }, []);
+  useEffect(() => { loadOrders(); }, [loadOrders]);
+
+  const updateStatus = async (id, status) => {
+    try { await API.updateOrderStatus(id, status); loadOrders(); } catch (e) { setToast(e.message); }
   };
+
+  const clearAll = async () => {
+    if (!confirm("Clear all orders?")) return;
+    try { await API.clearOrders(); setOrders([]); setToast("Orders cleared"); } catch (e) { setToast(e.message); }
+  };
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: "#6b7280" }}>Loading orders...</div>;
 
   return (
     <div className="fade-in">
       <div className="admin__header">
         <h1 className="admin__title">Orders ({orders.length})</h1>
-        {orders.length > 0 && (
-          <button className="admin__btn admin__btn--danger" onClick={() => { if (confirm("Clear all orders?")) setOrders([]); }}>Clear All</button>
-        )}
+        {orders.length > 0 && <button className="admin__btn admin__btn--danger" onClick={clearAll}>Clear All</button>}
       </div>
       {orders.length === 0 ? (
-        <div className="empty-state">
-          <div className="empty-state__icon">&#128230;</div>
-          <div className="empty-state__text">No orders yet. Orders appear here when customers checkout via WhatsApp.</div>
-        </div>
+        <div className="empty-state"><div className="empty-state__icon">&#128230;</div><div className="empty-state__text">No orders yet. Orders appear when customers checkout via WhatsApp.</div></div>
       ) : (
         <div className="admin__cards">
           {orders.map(order => (
             <div key={order.id} className="admin__card">
               <div className="admin__card-header">
-                <div>
-                  <div className="admin__card-title">Order #{order.id.slice(0, 8)}</div>
-                  <div className="admin__card-meta">{new Date(order.date).toLocaleString()}</div>
-                </div>
-                <span style={{ padding: "3px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700, background: order.status === "completed" ? "#ecfdf5" : order.status === "processing" ? "#eff6ff" : "#fef3c7", color: order.status === "completed" ? "#059669" : order.status === "processing" ? "#2563eb" : "#d97706" }}>
-                  {order.status}
-                </span>
+                <div><div className="admin__card-title">Order #{(order.id || "").slice(0, 8)}</div><div className="admin__card-meta">{new Date(order.date).toLocaleString()}</div></div>
+                <span style={{ padding: "3px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700, background: order.status === "completed" ? "#ecfdf5" : order.status === "processing" ? "#eff6ff" : "#fef3c7", color: order.status === "completed" ? "#059669" : order.status === "processing" ? "#2563eb" : "#d97706" }}>{order.status}</span>
               </div>
-              {order.items.map(item => (
-                <div key={item.key} style={{ fontSize: 13, padding: "4px 0", borderBottom: "1px solid #f1f5f9" }}>
-                  {item.name} ({item.storage}) x{item.qty} = {fmt(item.price * item.qty)}
-                </div>
+              {(order.items || []).map((item, i) => (
+                <div key={i} style={{ fontSize: 13, padding: "4px 0", borderBottom: "1px solid #f1f5f9" }}>{item.name} ({item.storage}) x{item.qty} = {fmt(item.price * item.qty)}</div>
               ))}
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10 }}>
                 <span style={{ fontSize: 16, fontWeight: 700, color: "#0056d2" }}>Total: {fmt(order.total)}</span>
@@ -1092,80 +1074,91 @@ function AdminOrders() {
 
 // ─── ADMIN: PROMOTIONS ────────────────────────────────────────────────────────
 function AdminPromotions() {
-  const { phones, setPhones, banners, setBanners, setToast } = useStore();
+  const { setToast, reloadPhones } = useStore();
+  const [phones, setLocalPhones] = useState([]);
+  const [banners, setBanners] = useState([]);
   const [discBrand, setDiscBrand] = useState("All");
   const [discVal, setDiscVal] = useState("");
   const [bannerText, setBannerText] = useState("");
 
-  const applyDiscount = () => {
+  useEffect(() => {
+    API.getPhonesFull().then(setLocalPhones).catch(() => {});
+    API.getAllBanners().then(setBanners).catch(() => {});
+  }, []);
+
+  const applyDiscount = async () => {
     const val = Number(discVal);
     if (!val || val < 0 || val > 100) return;
-    setPhones(prev => prev.map(p => {
-      if (discBrand !== "All" && p.brand !== discBrand) return p;
-      return { ...p, discount: val };
-    }));
-    setToast(`${val}% discount applied to ${discBrand === "All" ? "all" : discBrand} products`);
-    setDiscVal("");
+    try {
+      await API.bulkDiscount({ brand: discBrand, discount: val });
+      setToast(`${val}% discount applied`);
+      setDiscVal("");
+      API.getPhonesFull().then(setLocalPhones);
+      reloadPhones();
+    } catch (e) { setToast(e.message); }
   };
 
-  const clearDiscounts = () => {
-    setPhones(prev => prev.map(p => ({ ...p, discount: 0 })));
-    setToast("All discounts cleared");
+  const clearDiscounts = async () => {
+    try {
+      await API.bulkDiscount({ brand: "All", discount: 0 });
+      setToast("All discounts cleared");
+      API.getPhonesFull().then(setLocalPhones);
+      reloadPhones();
+    } catch (e) { setToast(e.message); }
   };
 
-  const addBanner = () => {
+  const addBannerHandler = async () => {
     if (!bannerText.trim()) return;
-    setBanners(prev => [...prev, { id: uid(), text: bannerText, active: true }]);
-    setBannerText("");
-    setToast("Banner added");
+    try {
+      await API.addBanner(bannerText);
+      setBannerText("");
+      setBanners(await API.getAllBanners());
+      setToast("Banner added");
+    } catch (e) { setToast(e.message); }
   };
 
-  const toggleBanner = (id) => {
-    setBanners(prev => prev.map(b => b.id === id ? { ...b, active: !b.active } : b));
+  const toggleBanner = async (id, active) => {
+    try {
+      await API.updateBanner(id, { active: !active });
+      setBanners(await API.getAllBanners());
+    } catch (e) { setToast(e.message); }
   };
 
-  const removeBanner = (id) => {
-    setBanners(prev => prev.filter(b => b.id !== id));
+  const removeBanner = async (id) => {
+    try {
+      await API.deleteBanner(id);
+      setBanners(await API.getAllBanners());
+      setToast("Banner removed");
+    } catch (e) { setToast(e.message); }
   };
 
   return (
     <div className="fade-in">
-      <div className="admin__header">
-        <h1 className="admin__title">Promotions & Deals</h1>
-      </div>
+      <div className="admin__header"><h1 className="admin__title">Promotions & Deals</h1></div>
 
-      {/* Discount Manager */}
       <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Bulk Discounts</h3>
       <div className="admin__stat-card" style={{ marginBottom: 24 }}>
         <div className="admin__filter-bar" style={{ marginBottom: 0 }}>
-          <select className="admin__select" value={discBrand} onChange={e => setDiscBrand(e.target.value)}>
-            <option value="All">All Brands</option>
-            <option value="Samsung">Samsung</option>
-            <option value="Apple">Apple</option>
-            <option value="Google">Google</option>
-          </select>
+          <select className="admin__select" value={discBrand} onChange={e => setDiscBrand(e.target.value)}><option value="All">All Brands</option><option value="Samsung">Samsung</option><option value="Apple">Apple</option><option value="Google">Google</option></select>
           <input className="admin__search" style={{ maxWidth: 100 }} type="number" placeholder="%" value={discVal} onChange={e => setDiscVal(e.target.value)} />
           <button className="admin__btn admin__btn--primary" onClick={applyDiscount}>Apply Discount</button>
           <button className="admin__btn admin__btn--danger" onClick={clearDiscounts}>Clear All</button>
         </div>
-        <div style={{ marginTop: 8, fontSize: 12, color: "#6b7280" }}>
-          Currently {phones.filter(p => p.discount > 0).length} products have active discounts
-        </div>
+        <div style={{ marginTop: 8, fontSize: 12, color: "#6b7280" }}>Currently {phones.filter(p => p.discount > 0).length} products have active discounts</div>
       </div>
 
-      {/* Banner Manager */}
       <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Banners</h3>
       <div className="admin__stat-card" style={{ marginBottom: 16 }}>
         <div className="admin__filter-bar" style={{ marginBottom: 0 }}>
           <input className="admin__search" placeholder="Banner text..." value={bannerText} onChange={e => setBannerText(e.target.value)} />
-          <button className="admin__btn admin__btn--primary" onClick={addBanner}>Add Banner</button>
+          <button className="admin__btn admin__btn--primary" onClick={addBannerHandler}>Add Banner</button>
         </div>
       </div>
       {banners.map(b => (
         <div key={b.id} className="admin__card" style={{ marginBottom: 8, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: 12 }}>
           <span style={{ flex: 1, fontSize: 14, opacity: b.active ? 1 : 0.5 }}>{b.text}</span>
           <div style={{ display: "flex", gap: 4 }}>
-            <button className="admin__table-btn" onClick={() => toggleBanner(b.id)}>{b.active ? "Disable" : "Enable"}</button>
+            <button className="admin__table-btn" onClick={() => toggleBanner(b.id, b.active)}>{b.active ? "Disable" : "Enable"}</button>
             <button className="admin__table-btn admin__table-btn--danger" onClick={() => removeBanner(b.id)}>Remove</button>
           </div>
         </div>
@@ -1176,59 +1169,65 @@ function AdminPromotions() {
 
 // ─── ADMIN: SETTINGS ──────────────────────────────────────────────────────────
 function AdminSettings() {
-  const { settings, setSettings, setToast } = useStore();
-  const [form, setForm] = useState({ ...settings });
-  const u = (k, v) => setForm(prev => ({ ...prev, [k]: v }));
+  const { setToast } = useStore();
+  const [form, setForm] = useState({ storeName: "", waNumber: "" });
+  const [pwForm, setPwForm] = useState({ currentPassword: "", newPassword: "" });
 
-  const save = () => {
-    setSettings(form);
-    setToast("Settings saved");
+  useEffect(() => { API.getSettings().then(setForm).catch(() => {}); }, []);
+
+  const saveSettings = async () => {
+    try { await API.updateSettings(form); setToast("Settings saved"); } catch (e) { setToast(e.message); }
+  };
+
+  const changePassword = async () => {
+    if (!pwForm.currentPassword || !pwForm.newPassword) return;
+    try {
+      await API.changePassword(pwForm.currentPassword, pwForm.newPassword);
+      setToast("Password changed");
+      setPwForm({ currentPassword: "", newPassword: "" });
+    } catch (e) { setToast(e.message); }
   };
 
   return (
     <div className="fade-in">
-      <div className="admin__header">
-        <h1 className="admin__title">Settings</h1>
-      </div>
+      <div className="admin__header"><h1 className="admin__title">Settings</h1></div>
+
       <div className="admin__stat-card">
-        <div className="admin__form-group">
-          <label className="admin__form-label">Store Name</label>
-          <input className="admin__form-input" value={form.storeName} onChange={e => u("storeName", e.target.value)} />
-        </div>
-        <div className="admin__form-group">
-          <label className="admin__form-label">WhatsApp Number (with country code)</label>
-          <input className="admin__form-input" value={form.waNumber} onChange={e => u("waNumber", e.target.value)} />
-        </div>
-        <div className="admin__form-group">
-          <label className="admin__form-label">Admin Password</label>
-          <input className="admin__form-input" type="password" value={form.adminPw} onChange={e => u("adminPw", e.target.value)} />
-        </div>
-        <button className="admin__btn admin__btn--primary" onClick={save}>Save Settings</button>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>Store Settings</h3>
+        <div className="admin__form-group"><label className="admin__form-label">Store Name</label><input className="admin__form-input" value={form.storeName} onChange={e => setForm(f => ({ ...f, storeName: e.target.value }))} /></div>
+        <div className="admin__form-group"><label className="admin__form-label">WhatsApp Number</label><input className="admin__form-input" value={form.waNumber} onChange={e => setForm(f => ({ ...f, waNumber: e.target.value }))} /></div>
+        <button className="admin__btn admin__btn--primary" onClick={saveSettings}>Save Settings</button>
+      </div>
+
+      <div className="admin__stat-card" style={{ marginTop: 16 }}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>Change Admin Password</h3>
+        <div className="admin__form-group"><label className="admin__form-label">Current Password</label><input className="admin__form-input" type="password" value={pwForm.currentPassword} onChange={e => setPwForm(f => ({ ...f, currentPassword: e.target.value }))} /></div>
+        <div className="admin__form-group"><label className="admin__form-label">New Password</label><input className="admin__form-input" type="password" value={pwForm.newPassword} onChange={e => setPwForm(f => ({ ...f, newPassword: e.target.value }))} /></div>
+        <button className="admin__btn admin__btn--primary" onClick={changePassword}>Change Password</button>
       </div>
 
       <div className="admin__stat-card" style={{ marginTop: 16 }}>
         <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Data Management</h3>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button className="admin__btn admin__btn--outline" onClick={() => {
-            const data = JSON.stringify({ phones: JSON.parse(localStorage.getItem("nex_phones")), orders: JSON.parse(localStorage.getItem("nex_orders")), banners: JSON.parse(localStorage.getItem("nex_banners")), settings: JSON.parse(localStorage.getItem("nex_settings")) });
-            const blob = new Blob([data], { type: "application/json" });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a"); a.href = url; a.download = "nexmobile-backup.json"; a.click();
-            URL.revokeObjectURL(url);
-            setToast("Backup downloaded");
+          <button className="admin__btn admin__btn--outline" onClick={async () => {
+            try {
+              const data = await API.downloadBackup();
+              const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a"); a.href = url; a.download = "nexmobile-backup.json"; a.click();
+              URL.revokeObjectURL(url);
+              setToast("Backup downloaded");
+            } catch (e) { setToast(e.message); }
           }}>Export Backup</button>
           <button className="admin__btn admin__btn--outline" onClick={() => {
             const input = document.createElement("input"); input.type = "file"; input.accept = ".json";
-            input.onchange = (e) => {
+            input.onchange = async (e) => {
               const file = e.target.files[0]; if (!file) return;
               const reader = new FileReader();
-              reader.onload = (ev) => {
+              reader.onload = async (ev) => {
                 try {
                   const data = JSON.parse(ev.target.result);
-                  if (data.phones) localStorage.setItem("nex_phones", JSON.stringify(data.phones));
-                  if (data.orders) localStorage.setItem("nex_orders", JSON.stringify(data.orders));
-                  if (data.banners) localStorage.setItem("nex_banners", JSON.stringify(data.banners));
-                  if (data.settings) localStorage.setItem("nex_settings", JSON.stringify(data.settings));
+                  await API.restoreBackup(data);
                   setToast("Backup restored! Refreshing...");
                   setTimeout(() => window.location.reload(), 1000);
                 } catch { setToast("Invalid backup file"); }
@@ -1237,11 +1236,6 @@ function AdminSettings() {
             };
             input.click();
           }}>Import Backup</button>
-          <button className="admin__btn admin__btn--danger" onClick={() => {
-            if (!confirm("This will clear ALL data and reset everything. Continue?")) return;
-            Object.keys(localStorage).filter(k => k.startsWith("nex_")).forEach(k => localStorage.removeItem(k));
-            window.location.reload();
-          }}>Factory Reset</button>
         </div>
       </div>
     </div>
